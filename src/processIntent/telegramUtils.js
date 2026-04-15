@@ -1,3 +1,5 @@
+import { patchSenderConversation } from "../shared/senderConversationMeta.js";
+
 /** Util Telegram ringan untuk process-intent (hindari dependensi siklik dengan intentHandlers). */
 
 export async function replyTelegram(chatId, text) {
@@ -45,4 +47,41 @@ export async function notifyUnknownIntentToAdmin({
   if (!res.ok) {
     console.warn("telegram_unknown_notify_failed", res.status, await res.text());
   }
+}
+
+/**
+ * Kirim balasan Telegram lalu persist lastSystemMessage (+ opsional state / pending top-up) ke SenderMeta.
+ * @param {object} p
+ * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} [p.ddb]
+ * @param {string} [p.tableSenderMeta]
+ * @param {string} [p.senderId]
+ * @param {unknown} p.chatId
+ * @param {string} p.text
+ * @param {string|null|undefined} [p.nextConversationState] — undefined = jangan ubah conversationState
+ * @param {number|null|undefined} [p.pendingTopUpCredits] — undefined = jangan ubah
+ */
+export async function replyAndRememberState(p) {
+  const {
+    ddb,
+    tableSenderMeta,
+    senderId,
+    chatId,
+    text,
+    nextConversationState,
+    pendingTopUpCredits,
+  } = p;
+  await replyTelegram(chatId, text);
+  if (!ddb || !tableSenderMeta || senderId == null || senderId === "") return;
+  /** @type {{ lastSystemMessage: string, conversationState?: string|null, pendingTopUpCredits?: number|null }} */
+  const patch = { lastSystemMessage: text };
+  if (nextConversationState !== undefined) {
+    patch.conversationState =
+      nextConversationState == null || nextConversationState === ""
+        ? ""
+        : String(nextConversationState);
+  }
+  if (pendingTopUpCredits !== undefined) {
+    patch.pendingTopUpCredits = pendingTopUpCredits;
+  }
+  await patchSenderConversation(ddb, tableSenderMeta, senderId, patch);
 }

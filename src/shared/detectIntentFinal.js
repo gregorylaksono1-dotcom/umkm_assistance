@@ -7,6 +7,7 @@ import {
   INTENT_TANYA_INFO,
   INTENT_UPLOAD_GAMBAR,
 } from "./constants.js";
+import { userSaysReadyToProcess } from "./bannerFlow.js";
 
 /**
  * @typedef {{ text?: string, caption?: string, photo?: boolean }} DetectMessage
@@ -119,9 +120,29 @@ export function isGreeting(text) {
 }
 
 /**
- * Deteksi deterministik (tanpa RAG). Mengembalikan null → lanjut RAG + classifier.
+ * Konfirmasi singkat untuk memproses gambar (selaras dengan userSaysReadyToProcess di alur banner/upload).
+ * @param {string} raw teks asli (trim)
+ */
+export function isProcessImageConfirmPhrase(raw) {
+  const t = String(raw ?? "").trim();
+  if (!t) return false;
+  const lower = t.toLowerCase();
+  const tokenOnly = lower.replace(/[.!?…]+$/u, "").trim();
+  if (
+    ["ya", "ok", "oke", "setuju", "iya", "y", "yes", "sip"].includes(
+      tokenOnly,
+    )
+  ) {
+    return true;
+  }
+  if (t.length > 120) return false;
+  return userSaysReadyToProcess([t]);
+}
+
+/**
+ * Deteksi deterministik (tanpa RAG). Mengembalikan null → lanjut Gemini classifier.
  *
- * Urutan: session → gambar → konfirmasi singkat → pertanyaan → aksi → salam.
+ * Urutan: gambar → konfirmasi singkat → session draft → pertanyaan → aksi → salam.
  *
  * @param {DetectMessage} message
  * @param {DetectSession} session
@@ -132,22 +153,21 @@ export function detectIntentFinalHeuristic(message, session) {
   const text = raw.toLowerCase();
   const hasImage = Boolean(message?.photo);
 
-  if (session?.state === "waiting_instruction") {
-    return {
-      intent: INTENT_UPLOAD_GAMBAR,
-      source: "session_waiting_instruction",
-    };
-  }
-
   if (hasImage) {
     return { intent: INTENT_UPLOAD_GAMBAR, source: "has_image" };
   }
 
-  const short = raw.toLowerCase();
-  if (["ya", "ok", "oke", "setuju"].includes(short)) {
+  if (isProcessImageConfirmPhrase(raw)) {
     return {
       intent: INTENT_PROCESS_IMAGE_CONFIRMED,
       source: "short_confirm",
+    };
+  }
+
+  if (session?.state === "waiting_instruction") {
+    return {
+      intent: INTENT_UPLOAD_GAMBAR,
+      source: "session_waiting_instruction",
     };
   }
 

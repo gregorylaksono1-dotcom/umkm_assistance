@@ -10,14 +10,18 @@ const READY_PATTERNS = [
   /\bsiap\s+(untuk\s+)?(di)?proses/i,
   /\bproses\b/i,
   /^gas\b/i,
+  /\bsikat\s+gas\b/i,
   /sudah\s+lengkap/i,
   /silakan\s+(di)?proses/i,
+  /silahkan\s+(di)?lanjut/i,
+  /^lanjut(kan)?\b/i,
   /^ya\b/i,
   /^iya\b/i,
   /^y\b$/i,
   /^yes\b/i,
   /\bok(e)?\b/i,
   /^sip\b/i,
+  /^setuju\b/i,
 ];
 
 /** Teks banner: bukan placeholder gambar saja, minimal beberapa karakter bermakna. */

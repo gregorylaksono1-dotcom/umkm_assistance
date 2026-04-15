@@ -31,6 +31,16 @@ import {
   extractPurchaseCreditsFromUserLines,
 } from "../shared/creditPurchase.js";
 import { analyzeBannerMaterials, resolveBannerReply } from "../shared/bannerFlow.js";
+import { isProcessImageConfirmPhrase } from "../shared/detectIntentFinal.js";
+import {
+  clearSenderConversation,
+  CONV_STATE_WAITING_TOPUP_AMOUNT,
+  CONV_STATE_WAITING_TOPUP_CONFIRMATION,
+  patchSenderConversation,
+  readConversationState,
+} from "../shared/senderConversationMeta.js";
+import { SPEC_INTENT } from "../shared/statefulIntentClassifier.js";
+import { replyAndRememberState } from "./telegramUtils.js";
 
 /** @param {object[]} windowItems */
 export function windowHasImageAttachment(windowItems) {
@@ -100,6 +110,25 @@ export async function computeUploadAndBannerRoutes(p) {
   };
 }
 
+/** @param {string[]} lines */
+function looksLikeTopupCancelFromLines(lines) {
+  const last = String(lines[lines.length - 1] ?? "").toLowerCase();
+  return /\b(batal|tidak\s*jadi|ga\s*jadi|gajadi|batalin|enggak|engga|cancel|tdk|gak\s*jadi)\b/i.test(
+    last,
+  );
+}
+
+/** @param {string[]} lines */
+function looksLikeTopupConfirmFromLines(lines) {
+  const last = lines.filter(Boolean);
+  const t = String(last[last.length - 1] ?? "").trim();
+  if (!t) return false;
+  if (t.length <= 56 && isProcessImageConfirmPhrase(t)) return true;
+  return /^(ya|y|yes|ok|oke|okee|sip|setuju|gas|lanjut|betul|benar|boleh)\b/i.test(
+    t,
+  );
+}
+
 /**
  * @param {object} ctx
  * @returns {Promise<object|null>} response object untuk langsung return dari handler, atau null
@@ -118,6 +147,9 @@ export async function handleBeliCredit(ctx) {
     replyTelegram,
     midtransSecretArn,
     tableBilling,
+    tableSenderMeta,
+    senderMetaSnapshot,
+    specIntent: specIntentRaw,
   } = ctx;
 
   if (intent !== INTENT_BELI_CREDIT) return null;
@@ -144,26 +176,87 @@ export async function handleBeliCredit(ctx) {
     };
   }
 
-  const purchaseLines = userTextLinesForPurchase(timelineItems, 24);
+  const meta = senderMetaSnapshot ?? {};
+  const persistedState = readConversationState(meta.conversationState);
+  const specIntentNorm = String(specIntentRaw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+  const pendingFromMeta =
+    meta.pendingTopUpCredits != null && meta.pendingTopUpCredits !== ""
+      ? Math.max(0, Math.trunc(Number(meta.pendingTopUpCredits)))
+      : null;
+
+  const purchaseLines = userTextLinesForPurchase(timelineItems, 3);
   const linesForCredits =
     purchaseLines.length > 0 ? purchaseLines : classifyLines;
-  const credits = extractPurchaseCreditsFromUserLines(
+  console.log("linesForCredits: ", linesForCredits);
+  const creditsParsed = extractPurchaseCreditsFromUserLines(
     linesForCredits,
     MIN_CREDIT_PURCHASE,
   );
+  console.log("creditsParsed: ", creditsParsed);
 
-  let replyText;
-  let redirectUrl;
-  if (credits == null) {
-    replyText = `Kak, sebutkan jumlah credit yang mau dibeli ya (minimal ${MIN_CREDIT_PURCHASE}). Contoh: beli 20 credit`;
-  } else if (credits < MIN_CREDIT_PURCHASE) {
-    replyText = `Minimal pembelian ${MIN_CREDIT_PURCHASE} credit ya kak.`;
-  } else {
+  const remember =
+    canTelegram && chatId && tableSenderMeta
+      ? async (text, nextState, pendingCredits) => {
+          await replyAndRememberState({
+            ddb,
+            tableSenderMeta,
+            senderId,
+            chatId,
+            text,
+            nextConversationState: nextState,
+            pendingTopUpCredits: pendingCredits,
+          });
+        }
+      : async (text, nextState, pendingCredits) => {
+          if (canTelegram) await replyTelegram(chatId, text);
+          if (ddb && tableSenderMeta) {
+            await patchSenderConversation(ddb, tableSenderMeta, senderId, {
+              lastSystemMessage: text,
+              conversationState: nextState ?? "",
+              pendingTopUpCredits: pendingCredits,
+            });
+          }
+        };
+
+  const inTopUpFlow =
+    persistedState === CONV_STATE_WAITING_TOPUP_AMOUNT ||
+    persistedState === CONV_STATE_WAITING_TOPUP_CONFIRMATION;
+
+  const cancelIntent =
+    specIntentNorm === SPEC_INTENT.CANCEL_TOPUP ||
+    (inTopUpFlow && looksLikeTopupCancelFromLines(classifyLines));
+
+  if (cancelIntent && inTopUpFlow) {
+    await clearSenderConversation(ddb, tableSenderMeta, senderId);
+    if (canTelegram) {
+      await replyTelegram(
+        chatId,
+        "Oke kak, pembelian credit-nya kami batalkan. Kalau mau top up lagi, bilang saja ya.",
+      );
+    }
+    return { ok: true, intent, mergedCount: windowItems.length };
+  }
+
+  if (cancelIntent && !inTopUpFlow && canTelegram) {
+    await replyTelegram(
+      chatId,
+      "Saat ini tidak ada pembelian credit yang menunggu konfirmasi ya kak.",
+    );
+    return { ok: true, intent, mergedCount: windowItems.length };
+  }
+
+  /** @param {number} c */
+  async function createSnapAndReply(c) {
+    let replyText;
+    let redirectUrl;
     try {
       const snap = await createSnapCreditPurchase({
         secretArn: midtransSecretArn,
         userId: senderId,
-        credits,
+        credits: c,
       });
       await ddb.send(
         new PutCommand({
@@ -173,7 +266,7 @@ export async function handleBeliCredit(ctx) {
             SK: `ORDER#${snap.orderId}`,
             userId: String(senderId),
             orderId: snap.orderId,
-            credits,
+            credits: c,
             grossAmount: snap.grossAmount,
             unitPriceIdr: CREDIT_UNIT_PRICE_IDR,
             provider: provider ?? null,
@@ -191,15 +284,95 @@ export async function handleBeliCredit(ctx) {
       replyText =
         "Maaf kak, link pembayaran gagal dibuat. Coba lagi sebentar lagi atau hubungi admin ya.";
     }
+    await patchSenderConversation(ddb, tableSenderMeta, senderId, {
+      conversationState: "",
+      lastSystemMessage: replyText,
+      pendingTopUpCredits: null,
+    });
+    if (canTelegram) await replyTelegram(chatId, replyText);
+    return { redirectUrl, replyText };
   }
 
-  if (canTelegram) await replyTelegram(chatId, replyText);
-  return {
-    ok: true,
-    intent,
-    mergedCount: windowItems.length,
-    redirect_url: redirectUrl,
-  };
+  if (persistedState === CONV_STATE_WAITING_TOPUP_CONFIRMATION) {
+    const confirmNow =
+      specIntentNorm === SPEC_INTENT.CONFIRM_TOPUP ||
+      looksLikeTopupConfirmFromLines(classifyLines);
+
+    if (
+      specIntentNorm === SPEC_INTENT.PROVIDE_TOPUP_AMOUNT &&
+      creditsParsed != null &&
+      creditsParsed >= MIN_CREDIT_PURCHASE
+    ) {
+      const gross = creditsParsed * CREDIT_UNIT_PRICE_IDR;
+      const msg = `Baik kak, kami ubah jadi **${creditsParsed} credit** (± Rp ${gross.toLocaleString("id-ID")}).\n\nKonfirmasi beli? Balas **ya** untuk lanjut atau **tidak** untuk batal.`;
+      await remember(msg, CONV_STATE_WAITING_TOPUP_CONFIRMATION, creditsParsed);
+      return { ok: true, intent, mergedCount: windowItems.length };
+    }
+
+    if (confirmNow) {
+      const useCredits =
+        pendingFromMeta != null && pendingFromMeta >= MIN_CREDIT_PURCHASE
+          ? pendingFromMeta
+          : creditsParsed;
+      if (useCredits == null || useCredits < MIN_CREDIT_PURCHASE) {
+        const msg = `Kak, kami tidak menemukan jumlah credit yang valid. Sebutkan lagi jumlahnya ya (minimal ${MIN_CREDIT_PURCHASE}).`;
+        await remember(msg, CONV_STATE_WAITING_TOPUP_AMOUNT, null);
+        return { ok: true, intent, mergedCount: windowItems.length };
+      }
+      const out = await createSnapAndReply(useCredits);
+      return {
+        ok: true,
+        intent,
+        mergedCount: windowItems.length,
+        redirect_url: out.redirectUrl,
+      };
+    }
+
+    const remind = `Mohon konfirmasi dulu ya kak: balas **ya** untuk lanjut bayar, atau **tidak** kalau mau batal.`;
+    await remember(
+      remind,
+      CONV_STATE_WAITING_TOPUP_CONFIRMATION,
+      pendingFromMeta ?? undefined,
+    );
+    return { ok: true, intent, mergedCount: windowItems.length };
+  }
+
+  if (persistedState === CONV_STATE_WAITING_TOPUP_AMOUNT) {
+    if (creditsParsed != null && creditsParsed >= MIN_CREDIT_PURCHASE) {
+      const gross = creditsParsed * CREDIT_UNIT_PRICE_IDR;
+      const msg = `Konfirmasi beli **${creditsParsed} credit** (± Rp ${gross.toLocaleString("id-ID")})?\n\nBalas **ya** untuk dapatkan link bayar, atau **tidak** untuk batal.`;
+      await remember(msg, CONV_STATE_WAITING_TOPUP_CONFIRMATION, creditsParsed);
+      return { ok: true, intent, mergedCount: windowItems.length };
+    }
+    const msg = `Kak, sebutkan jumlah credit yang mau dibeli ya (minimal ${MIN_CREDIT_PURCHASE}). Contoh: 20 atau "beli 20 credit".`;
+    await remember(msg, CONV_STATE_WAITING_TOPUP_AMOUNT, undefined);
+    return { ok: true, intent, mergedCount: windowItems.length };
+  }
+
+  if (creditsParsed == null) {
+    const msg = `Kak, sebutkan jumlah credit yang mau dibeli ya (minimal ${MIN_CREDIT_PURCHASE}). Contoh: beli 20 credit`;
+    await remember(msg, CONV_STATE_WAITING_TOPUP_AMOUNT, undefined);
+    return { ok: true, intent, mergedCount: windowItems.length };
+  }
+
+  if (creditsParsed < MIN_CREDIT_PURCHASE) {
+    const replyText = `Minimal pembelian ${MIN_CREDIT_PURCHASE} credit ya kak.`;
+    if (canTelegram) await replyTelegram(chatId, replyText);
+    return {
+      ok: true,
+      intent,
+      mergedCount: windowItems.length,
+    };
+  }
+
+  const gross = creditsParsed * CREDIT_UNIT_PRICE_IDR;
+  const msg = `Konfirmasi beli **${creditsParsed} credit** (± Rp ${gross.toLocaleString("id-ID")})?\n\nBalas **ya** untuk dapatkan link bayar, atau **tidak** untuk batal.`;
+  await remember(
+    msg,
+    CONV_STATE_WAITING_TOPUP_CONFIRMATION,
+    creditsParsed,
+  );
+  return { ok: true, intent, mergedCount: windowItems.length };
 }
 
 /**
@@ -214,6 +387,8 @@ export async function handleUploadGambar(ctx) {
     tableBilling,
     tableGenerationRequest,
     tableGenerationConfirmIdempotency,
+    tableSenderMeta,
+    uploadSlotResetAfterAt,
     senderId,
     chatId,
     provider,
@@ -229,6 +404,30 @@ export async function handleUploadGambar(ctx) {
 
   if (!uploadGambarPath) return null;
   console.log("Masuk handleUploadGambar: ", intent);
+
+  if (intent === INTENT_UPLOAD_GAMBAR && tableBilling) {
+    const profile = await ensureBillingProfile(ddb, tableBilling, senderId);
+    const paidCredits =
+      profile.kind === "ok" ? Math.max(0, Number(profile.credits) || 0) : 0;
+    if (paidCredits <= 0) {
+      if (canTelegram && chatId) {
+        await replyTelegram(
+          chatId,
+          "Untuk upload dan edit foto, perlu saldo credit berbayar (field credits) lebih dari 0. Silakan top up dulu ya kak.",
+        );
+      }
+      return {
+        ok: true,
+        intent,
+        mergedCount: windowItems.length,
+        upload_flow: {
+          handled: true,
+          credit_gate: "upload_blocked_zero_paid_credits",
+        },
+      };
+    }
+  }
+
   const uploadOut = await runUploadGambarFlow({
     ddb,
     tableRequestResource,
@@ -246,6 +445,8 @@ export async function handleUploadGambar(ctx) {
     triggerMessageId,
     tableGenerationRequest,
     tableGenerationConfirmIdempotency,
+    tableSenderMeta,
+    uploadSlotResetAfterAt,
   });
 
   if (!uploadOut.handled) return null;

@@ -4,13 +4,17 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { getGeminiApiKey } from "../shared/secrets.js";
-import { classifyIntent } from "../shared/gemini.js";
+import { mapSpecToRouterIntent } from "../shared/intentSpecMap.js";
 import {
   loadRagCredentials,
-  ragIntentConfigFromEnv,
   ragKnowledgeConfigFromEnv,
   retrieveProductRagContext,
 } from "../shared/ragProduct.js";
+import {
+  CONV_STATE_WAITING_IMAGE_PROMPT,
+  readConversationState,
+} from "../shared/senderConversationMeta.js";
+import { classifyIntentWithState } from "../shared/statefulIntentClassifier.js";
 import {
   INTENT_CLASSIFIER_GUIDE,
   INTENT_PROCESS_IMAGE_CONFIRMED,
@@ -21,7 +25,6 @@ import {
   normalizeIntentForRouting,
 } from "../shared/constants.js";
 import {
-  detectIntentFinalHeuristic,
   pickTriggerWindowItem,
   windowItemToDetectMessage,
 } from "../shared/detectIntentFinal.js";
@@ -189,47 +192,7 @@ async function loadMessageWindowAndTimeline(p) {
 }
 
 /**
- * @returns {Promise<{ ragResult: object|null, intentKnowledgeForClassifier: string, classified: object }>}
- */
-async function runIntentRagAndClassifier(apiKey, classifyLines) {
-  let ragResult = null;
-  let intentKnowledgeForClassifier = "";
-  try {
-    const intentRagCfg = ragIntentConfigFromEnv();
-    const intentCreds = await loadRagCredentials(intentRagCfg);
-    ragResult = await retrieveProductRagContext(
-      classifyLines.join("\n"),
-      intentCreds,
-      { phase: "intent" },
-    );
-    intentKnowledgeForClassifier =
-      ragResult.vectorIntent &&
-      ragResult.vectorIntent !== INTENT_UNKNOWN &&
-      ragResult.vectorIntent !== "unknown"
-        ? [
-            `**Sinyal metadata kutipan (agregasi vektor):** "${ragResult.vectorIntent}". Gunakan jika selaras dengan pesan user; jika tidak, tentukan dari kutipan teks.`,
-            ragResult.context,
-          ].join("\n\n---\n\n")
-        : ragResult.context;
-  } catch (ragErr) {
-    console.warn("intent_rag_unavailable_fallback_static", ragErr);
-    intentKnowledgeForClassifier = [
-      "Panduan intent (fallback — RAG tidak tersedia):",
-      INTENT_CLASSIFIER_GUIDE,
-    ].join("\n\n");
-  }
-
-  const classified = await classifyIntent(
-    apiKey,
-    classifyLines,
-    intentKnowledgeForClassifier,
-  );
-
-  return { ragResult, intentKnowledgeForClassifier, classified };
-}
-
-/**
- * Fallback vektor + konteks RAG balasan (indeks intent vs knowledge).
+ * Konteks balasan produk (knowledge RAG) setelah intent final; fase intent vector tidak dipakai lagi.
  */
 async function resolveFinalIntentAndProductContext(
   classifyLines,
@@ -353,6 +316,9 @@ function logIntentResolution(p) {
   console.log("intent_rag_resolution", {
     finalIntent: intent,
     geminiIntent,
+    specIntent: classified?.specIntent ?? null,
+    specConfidence: classified?.confidence ?? null,
+    specReason: classified?.reason ?? null,
     vectorIntent: ragResult?.vectorIntent ?? null,
     usedVectorFallback,
     usedKnowledgeRag: intent === INTENT_TANYA_INFO,
@@ -471,64 +437,106 @@ export async function runIntentProcessingPipeline(deps, event) {
       isActiveUploadDraft(openDraft)
         ? { state: "waiting_instruction" }
         : {};
+    const stateFromMeta = readConversationState(meta.conversationState);
+    let effectiveConversationState = stateFromMeta;
+    if (
+      !effectiveConversationState &&
+      openDraft &&
+      String(openDraft.chatId ?? "") === String(chatId) &&
+      isActiveUploadDraft(openDraft)
+    ) {
+      effectiveConversationState = CONV_STATE_WAITING_IMAGE_PROMPT;
+    }
+    const lastSystemMessage = String(meta.lastSystemMessage ?? "");
 
     const triggerItem = pickTriggerWindowItem(windowItems, triggerMessageId);
     const message = windowItemToDetectMessage(triggerItem);
-    const heuristicResult = detectIntentFinalHeuristic(message, session);
+    const triggerTextForLog = String(
+      message.text || message.caption || "",
+    ).trim();
+
+    const statePrefix = effectiveConversationState
+      ? `[Konteks percakapan: current_state=${effectiveConversationState}. Utamakan kelanjutan alur ini.]`
+      : "";
+    const draftPrefix =
+      session?.state === "waiting_instruction"
+        ? "[Konteks bot: user punya draft upload/edit foto aktif di chat ini — klasifikasikan pesan sebagai kelanjutan alur tersebut bila relevan (upload gambar, process_image_confirmed, tema/teks banner, dll.).]"
+        : "";
+
+    const linesForClassifier = [
+      statePrefix,
+      draftPrefix,
+      ...classifyLines,
+    ].filter(Boolean);
+
+    const hasImageAttachment = windowItems.some((i) =>
+      Boolean(i.hasImage || i.imageFileId),
+    );
 
     let ragResult = null;
-    /** @type {{ intent?: string, rawModelText?: string, source?: string, heuristicSource?: string }} */
+    /** @type {{ intent?: string, rawModelText?: string, source?: string, heuristicSource?: string, specIntent?: string, confidence?: number, reason?: string }} */
     let classified = { rawModelText: "" };
     let geminiIntent;
     let usedVectorFallback = false;
-    let skippedRagForShortcut = false;
+    const skippedRagForShortcut = false;
     /** @type {string|undefined} */
-    let intentFinalHeuristicSource;
+    const intentFinalHeuristicSource = undefined;
 
-    if (heuristicResult) {
-      skippedRagForShortcut = true;
-      intentFinalHeuristicSource = heuristicResult.source;
-      intent = normalizeIntentForRouting(heuristicResult.intent);
-      geminiIntent = intent;
-      classified = {
-        intent,
-        rawModelText: "",
-        source: "intent_final_heuristic",
-        heuristicSource: heuristicResult.source,
-      };
-      productRagContextForReply = null;
+    const st = await classifyIntentWithState(apiKey, {
+      current_state: effectiveConversationState,
+      last_system_message: lastSystemMessage,
+      user_message: linesForClassifier.join("\n"),
+      ragGuideSlice: INTENT_CLASSIFIER_GUIDE,
+    });
+    const routerFromSpec = mapSpecToRouterIntent(
+      st.specIntent,
+      effectiveConversationState,
+      { hasImageAttachment },
+    );
+    classified = {
+      intent: normalizeIntentForRouting(routerFromSpec),
+      specIntent: st.specIntent,
+      confidence: st.confidence,
+      reason: st.reason,
+      rawModelText: st.rawModelText,
+      source: st.source,
+    };
 
-      if (intent === INTENT_TANYA_INFO) {
-        try {
-          const knCfg = ragKnowledgeConfigFromEnv();
-          const knCreds = await loadRagCredentials(knCfg);
-          const knResult = await retrieveProductRagContext(
-            classifyLines.join("\n"),
-            knCreds,
-            { phase: "knowledge" },
-          );
-          productRagContextForReply = knResult.context;
-        } catch (knErr) {
-          console.warn("knowledge_rag_heuristic_tanya_info", knErr);
-          productRagContextForReply = null;
-        }
-      }
-    } else {
-      const ragOut = await runIntentRagAndClassifier(apiKey, classifyLines);
-      ragResult = ragOut.ragResult;
-      classified = ragOut.classified;
+    const resolved = await resolveFinalIntentAndProductContext(
+      classifyLines,
+      ragResult,
+      classified,
+    );
 
-      const resolved = await resolveFinalIntentAndProductContext(
-        classifyLines,
-        ragResult,
-        classified,
-      );
+    intent = normalizeIntentForRouting(resolved.intent);
+    geminiIntent = normalizeIntentForRouting(resolved.geminiIntent);
+    usedVectorFallback = resolved.usedVectorFallback;
+    productRagContextForReply = resolved.productRagContextForReply;
 
-      intent = resolved.intent;
-      geminiIntent = resolved.geminiIntent;
-      usedVectorFallback = resolved.usedVectorFallback;
-      productRagContextForReply = resolved.productRagContextForReply;
-    }
+    console.log("intent_detection_resolved", {
+      triggerMessageId: String(triggerMessageId),
+      triggerText: triggerTextForLog,
+      triggerTextPreview: triggerTextForLog.slice(0, 200),
+      classifyLinesPreview: classifyLines
+        .join(" | ")
+        .replace(/\s+/g, " ")
+        .slice(0, 400),
+      sessionState: session?.state ?? null,
+      conversationState: effectiveConversationState ?? null,
+      lastSystemMessagePreview: lastSystemMessage.replace(/\s+/g, " ").slice(0, 200),
+      specIntent: classified?.specIntent ?? null,
+      specConfidence: classified?.confidence ?? null,
+      specReason: classified?.reason ?? null,
+      hasImageOnTriggerBubble: Boolean(message.photo),
+      heuristic: null,
+      gemini: {
+        intent: classified?.intent ?? null,
+        source: classified?.source ?? null,
+        rawModelText: String(classified?.rawModelText ?? "").slice(0, 400),
+      },
+      finalIntent: intent,
+      finalGeminiIntent: geminiIntent,
+    });
 
     const draftBlock = await maybeReturnForOpenUploadDraft({
       ddb,
@@ -590,10 +598,17 @@ export async function runIntentProcessingPipeline(deps, event) {
       tableRequestResource,
       tableGenerationRequest,
       tableGenerationConfirmIdempotency,
+      tableSenderMeta,
+      uploadSlotResetAfterAt: meta.uploadSlotResetAfterAt,
       gsiRequestUserProcess,
       uploadGambarPath: routes.uploadGambarPath,
       bannerIntentWithImage: routes.bannerIntentWithImage,
       notifyUnknown: notifyUnknownIntentToAdmin,
+      senderMetaSnapshot: meta,
+      specIntent: classified.specIntent,
+      specConfidence: classified.confidence,
+      specReason: classified.reason,
+      effectiveConversationState,
     };
 
     return await dispatchByIntent(ctx);

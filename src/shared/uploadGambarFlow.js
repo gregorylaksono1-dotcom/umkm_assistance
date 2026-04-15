@@ -3,6 +3,7 @@ import {
   GetCommand,
   PutCommand,
   QueryCommand,
+  UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import {
@@ -14,12 +15,16 @@ import {
 } from "./constants.js";
 import { ensureBillingProfile } from "./creditProfile.js";
 import {
+  CONV_STATE_WAITING_IMAGE_PROMPT,
+  patchSenderConversation,
+} from "./senderConversationMeta.js";
+import {
   buildGenerationConfirmIdempotencyKey,
   getGenerationConfirmIdempotency,
   transactSubmitGenerationRequest,
 } from "./generationRequestSubmit.js";
 import { extractUploadGambarSlots } from "./gemini.js";
-import { userSaysReadyToProcess } from "./bannerFlow.js";
+import { isProcessImageConfirmPhrase } from "./detectIntentFinal.js";
 
 const s3 = new S3Client({});
 
@@ -27,11 +32,85 @@ const PLACEHOLDER = "[gambar]";
 const GSI_FALSE = "false";
 const GSI_TRUE = "true";
 
+/**
+ * Konfirmasi via heuristik (bukan intent classifier) hanya jika bubble pemicu pendek.
+ * Teks banner/promo panjang sering mengandung "ok", "proses", "gas", dll. dan memicu false positive.
+ */
+const MAX_TRIGGER_LEN_FOR_AMBIGUOUS_CONFIRM = 56;
+
 /** @param {string|undefined} text */
 function meaningfulUserText(text) {
   const t = String(text ?? "").trim();
   if (!t || t === PLACEHOLDER) return "";
   return t;
+}
+
+/**
+ * Batasi riwayat ke satu "giliran" upload: dari foto user terakhir, plus teks user
+ * sejak foto sebelumnya (agar pola "tema dulu, baru foto" tetap terbaca).
+ * Menghindari tema/teks dari batch gambar yang sudah dikonfirmasi di atasnya.
+ *
+ * @param {Array<Record<string, unknown>>} items ascending time
+ */
+function itemsSliceForCurrentImageTurn(items) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  let lastImg = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it?.imageFileId || it?.hasImage) {
+      lastImg = i;
+      break;
+    }
+  }
+  if (lastImg < 0) return items;
+  let start = lastImg;
+  for (let i = lastImg - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it?.imageFileId || it?.hasImage) break;
+    start = i;
+  }
+  return items.slice(start);
+}
+
+/**
+ * Hanya pesan setelah konfirmasi job gambar terakhir (watermark di sender meta).
+ * Menghindari tema/teks batch lama yang masih berada di antara dua foto di timeline.
+ *
+ * @param {Array<Record<string, unknown>>} items
+ * @param {number} resetAfterMs
+ */
+function timelineItemsAfterUploadSlotReset(items, resetAfterMs) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  const t = Number(resetAfterMs);
+  if (!Number.isFinite(t) || t <= 0) return items;
+  return items.filter((it) => Number(it.createdAt ?? 0) > t);
+}
+
+/**
+ * Setelah transact konfirmasi sukses: batasi konteks slot LLM ke pesan berikutnya.
+ *
+ * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} ddb
+ * @param {string|undefined} tableSenderMeta
+ * @param {unknown} senderId
+ */
+async function persistUploadSlotResetAfterConfirm(ddb, tableSenderMeta, senderId) {
+  if (!tableSenderMeta || senderId == null || senderId === "") return;
+  const t = Date.now();
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: tableSenderMeta,
+        Key: { senderId: String(senderId) },
+        UpdateExpression: "SET uploadSlotResetAfterAt = :ts",
+        ExpressionAttributeValues: { ":ts": t },
+      }),
+    );
+  } catch (err) {
+    console.warn("upload_slot_reset_meta_failed", {
+      senderId: String(senderId),
+      err,
+    });
+  }
 }
 
 /**
@@ -551,11 +630,39 @@ async function persistResource(ddb, table, resource) {
 }
 
 /**
+ * Selaraskan SenderMeta.conversationState dengan alur upload (klasifikasi stateful).
+ *
+ * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} ddb
+ * @param {string|undefined} tableSenderMeta
+ * @param {unknown} senderId
+ * @param {(cid: unknown, text: string) => Promise<void>} replyTelegram
+ * @param {unknown} chatId
+ * @param {string} text
+ */
+async function replyTelegramWithImagePromptState(
+  ddb,
+  tableSenderMeta,
+  senderId,
+  replyTelegram,
+  chatId,
+  text,
+) {
+  await replyTelegram(chatId, text);
+  if (!ddb || !tableSenderMeta || senderId == null || senderId === "") return;
+  await patchSenderConversation(ddb, tableSenderMeta, senderId, {
+    conversationState: CONV_STATE_WAITING_IMAGE_PROMPT,
+    lastSystemMessage: text,
+  });
+}
+
+/**
  * @param {object} opts
  * @param {string} [opts.jobKind]
  * @param {string} [opts.triggerMessageId] — untuk idempotensi confirm (payload process-intent)
  * @param {string} [opts.tableGenerationRequest]
  * @param {string} [opts.tableGenerationConfirmIdempotency]
+ * @param {string} [opts.tableSenderMeta]
+ * @param {number} [opts.uploadSlotResetAfterAt] — milidetik; hanya pesan dengan createdAt lebih besar yang dipakai untuk slot LLM
  */
 export async function runUploadGambarFlow(opts) {
   const {
@@ -576,6 +683,8 @@ export async function runUploadGambarFlow(opts) {
     triggerMessageId: triggerMessageIdOpt,
     tableGenerationRequest,
     tableGenerationConfirmIdempotency,
+    tableSenderMeta,
+    uploadSlotResetAfterAt: uploadSlotResetAfterAtOpt,
   } = opts;
 
   if (!apiKey) {
@@ -602,19 +711,27 @@ export async function runUploadGambarFlow(opts) {
   });
 
   const hasImageInWindow = windowHasImage;
-  const textLines = timelineItems
+  const resetMs = Number(uploadSlotResetAfterAtOpt ?? 0);
+  const timelineScoped = timelineItemsAfterUploadSlotReset(
+    timelineItems,
+    resetMs,
+  );
+  const windowScoped = timelineItemsAfterUploadSlotReset(windowItems, resetMs);
+  const timelineForSlots = itemsSliceForCurrentImageTurn(timelineScoped);
+  const windowForSlots = itemsSliceForCurrentImageTurn(windowScoped);
+  const textLines = timelineForSlots
     .slice(-12)
     .map((i) => meaningfulUserText(i.text))
     .filter(Boolean);
   const userTextBlobFallback =
     textLines.join("\n") ||
-    windowItems
+    windowForSlots
       .map((i) => meaningfulUserText(i.text))
       .filter(Boolean)
       .join("\n");
 
   /** Teks dari bubble yang punya gambar + caption di pesan yang sama → prioritas untuk LLM. */
-  const comboTexts = windowItems
+  const comboTexts = windowForSlots
     .filter(
       (i) =>
         (i.imageFileId || i.hasImage) && meaningfulUserText(i.text),
@@ -625,8 +742,29 @@ export async function runUploadGambarFlow(opts) {
     ? comboTexts.join("\n")
     : userTextBlobFallback;
 
+  const triggerMsgId = String(triggerMessageIdOpt ?? "");
+  const triggerWinItem =
+    (triggerMsgId &&
+      windowItems.find((i) => String(i.messageId ?? "") === triggerMsgId)) ||
+    windowItems[windowItems.length - 1];
+  const triggerUserText = meaningfulUserText(triggerWinItem?.text);
+
+  const snapshotShown =
+    String(resource.confirmSnapshotShown ?? "").trim().length > 0;
+  const hasSnapshotAwaiting =
+    snapshotShown &&
+    (awaitingUserConfirmIsTrue(resource) ||
+      classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED);
+  const triggerLooksLikeConfirm =
+    classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED ||
+    isProcessImageConfirmPhrase(triggerUserText);
+  const skipSlotExtraction = hasSnapshotAwaiting && triggerLooksLikeConfirm;
+
   let llm = { themeStyle: null, bannerText: null };
-  if (String(userTextBlobForLlm ?? "").trim()) {
+  if (
+    !skipSlotExtraction &&
+    String(userTextBlobForLlm ?? "").trim()
+  ) {
     try {
       llm = await extractUploadGambarSlots(apiKey, {
         userTextBlob: userTextBlobForLlm,
@@ -690,6 +828,7 @@ export async function runUploadGambarFlow(opts) {
     hasBannerAfter
   ) {
     resource.confirmSnapshotShown = undefined;
+    resource.awaitingUserConfirm = false;
   }
 
   if (windowHasImage && provider === "whatsapp") {
@@ -710,20 +849,43 @@ export async function runUploadGambarFlow(opts) {
     await persistResource(ddb, tableRequestResource, resource);
 
     if (canTelegram && chatId) {
-      const { text: head, appendThemePrompt } = buildMissingUploadSlotsReply(
-        hasPendingImages,
-        hasTheme,
-        resource,
-      );
-      let msg = head;
-      if (appendThemePrompt) {
-        msg += `\n\n${formatThemePrompt()}`;
-      } else if (!hasPendingImages) {
-        msg += " Silakan kirim foto ke chat ini.";
+      if (classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED) {
+        await replyTelegramWithImagePromptState(
+          ddb,
+          tableSenderMeta,
+          senderId,
+          replyTelegram,
+          chatId,
+          "Silakan kirim foto ke chat ini, lalu tulis tema/gaya (dan teks promo bila perlu). Setelah ringkasan muncul, balas **ya** atau **setuju** untuk lanjut proses ya kak.",
+        );
+      } else {
+        const { text: head, appendThemePrompt } = buildMissingUploadSlotsReply(
+          hasPendingImages,
+          hasTheme,
+          resource,
+        );
+        let msg = head;
+        if (appendThemePrompt) {
+          msg += `\n\n${formatThemePrompt()}`;
+        } else if (!hasPendingImages) {
+          msg += " Silakan kirim foto ke chat ini.";
+        }
+        await replyTelegramWithImagePromptState(
+          ddb,
+          tableSenderMeta,
+          senderId,
+          replyTelegram,
+          chatId,
+          msg,
+        );
       }
-      await replyTelegram(chatId, msg);
     }
-    return { handled: true, needSlots: true };
+    return {
+      handled: true,
+      needSlots: true,
+      confirmRedirectedToUpload:
+        classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED,
+    };
   }
 
   const snapshot = buildSnapshot(resource);
@@ -736,44 +898,38 @@ export async function runUploadGambarFlow(opts) {
   const readyBlob =
     recentForReady.length > 0 ? recentForReady : classifyLinesFromWindow(windowItems);
 
-  const intentConfirms =
+  /**
+   * Transact konfirmasi: hanya intent eksplisit atau frasa singkat pada bubble pemicu.
+   * Jangan pakai userSaysReadyToProcess(readyBlob): gabungan 8 baris timeline memicu false positive
+   * (mis. "ya" di baris pertama + teks banner di baris terakhir).
+   */
+  const intentConfirmsForTransact =
     classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED ||
-    userSaysReadyToProcess(readyBlob);
+    (triggerUserText.length > 0 &&
+      triggerUserText.length <= MAX_TRIGGER_LEN_FOR_AMBIGUOUS_CONFIRM &&
+      isProcessImageConfirmPhrase(triggerUserText));
 
-  if (!sameAsShown) {
-    resource.confirmSnapshotShown = snapshot;
-    resource.awaitingUserConfirm = true;
-    await persistResource(ddb, tableRequestResource, resource);
+  const snapshotShownNow =
+    String(resource.confirmSnapshotShown ?? "").trim().length > 0;
 
-    console.log("upload_awaiting_theme_style_confirm", {
-      chatId: String(chatId ?? ""),
-      userId: String(senderId ?? ""),
-      theme: resource.theme ?? null,
-      themeDisplay: themeLabelForDisplay(resource.theme),
-      bannerText: resource.bannerText ?? null,
-      photoCount: resource.pendingImageEntries.length,
-      snapshot,
-      nextStep:
-        "Balasan user (ya/setuju/…) akan dianggap process_image_confirmed untuk lanjut proses",
-    });
+  const shouldProcessImageConfirm =
+    intentConfirmsForTransact &&
+    hasPendingImages &&
+    hasTheme &&
+    (awaitingUserConfirmIsTrue(resource) ||
+      (snapshotShownNow &&
+        classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED));
 
-    if (canTelegram && chatId) {
-      await replyTelegram(
-        chatId,
-        buildThemeStyleConfirmTelegramMessage(resource),
-      );
-    }
-    return { handled: true, askedConfirm: true, draftUpdated: true };
-  }
-
-  if (resource.awaitingUserConfirm && intentConfirms) {
+  if (shouldProcessImageConfirm) {
     console.log("process_image_confirmed", {
       stage: "user_confirmed_enter_pipeline",
       intent: INTENT_PROCESS_IMAGE_CONFIRMED,
       classifiedIntent: classifiedIntent ?? null,
       matchedByClassifierIntent:
         classifiedIntent === INTENT_PROCESS_IMAGE_CONFIRMED,
-      matchedByReadyHeuristic: userSaysReadyToProcess(readyBlob),
+      matchedByConfirmPhraseOnTrigger: isProcessImageConfirmPhrase(
+        triggerUserText,
+      ),
       theme: resource.theme ?? null,
       bannerText: resource.bannerText ?? null,
       photoCount: resource.pendingImageEntries.length,
@@ -972,13 +1128,50 @@ export async function runUploadGambarFlow(opts) {
       generationId,
     });
 
+    await persistUploadSlotResetAfterConfirm(ddb, tableSenderMeta, senderId);
+
     if (canTelegram && chatId) {
-      await replyTelegram(
-        chatId,
-        "Siap kak! Permintaan sudah dikonfirmasi dan kami proses sesuai ringkasan tadi.",
-      );
+      const successText =
+        "Siap kak! Permintaan sudah dikonfirmasi dan kami proses sesuai ringkasan tadi.";
+      await replyTelegram(chatId, successText);
+      if (ddb && tableSenderMeta && senderId != null && senderId !== "") {
+        await patchSenderConversation(ddb, tableSenderMeta, senderId, {
+          conversationState: "",
+          lastSystemMessage: successText,
+        });
+      }
     }
     return { handled: true, confirmed: true, jobKind, generationId };
+  }
+
+  if (!sameAsShown) {
+    resource.confirmSnapshotShown = snapshot;
+    resource.awaitingUserConfirm = true;
+    await persistResource(ddb, tableRequestResource, resource);
+
+    console.log("upload_awaiting_theme_style_confirm", {
+      chatId: String(chatId ?? ""),
+      userId: String(senderId ?? ""),
+      theme: resource.theme ?? null,
+      themeDisplay: themeLabelForDisplay(resource.theme),
+      bannerText: resource.bannerText ?? null,
+      photoCount: resource.pendingImageEntries.length,
+      snapshot,
+      nextStep:
+        "Balasan user (ya/setuju/…) akan dianggap process_image_confirmed untuk lanjut proses",
+    });
+
+    if (canTelegram && chatId) {
+      await replyTelegramWithImagePromptState(
+        ddb,
+        tableSenderMeta,
+        senderId,
+        replyTelegram,
+        chatId,
+        buildThemeStyleConfirmTelegramMessage(resource),
+      );
+    }
+    return { handled: true, askedConfirm: true, draftUpdated: true };
   }
 
   if (!resource.awaitingUserConfirm) {
@@ -998,7 +1191,11 @@ export async function runUploadGambarFlow(opts) {
     });
 
     if (canTelegram && chatId) {
-      await replyTelegram(
+      await replyTelegramWithImagePromptState(
+        ddb,
+        tableSenderMeta,
+        senderId,
+        replyTelegram,
         chatId,
         buildThemeStyleConfirmTelegramMessage(resource),
       );

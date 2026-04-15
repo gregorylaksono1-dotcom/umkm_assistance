@@ -39,6 +39,37 @@ async function withGeminiRetry(generateOnce) {
   }
 }
 
+/**
+ * Gemini kadang membungkus JSON dengan ```json ... ``` atau menambah teks di luar objek.
+ * @param {string} raw
+ * @returns {Record<string, unknown>|null}
+ */
+export function parseJsonObjectFromModelText(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) return null;
+  s = s.replace(/^```(?:json)?\s*/i, "");
+  s = s.replace(/\s*```\s*$/i, "");
+  s = s.trim();
+  try {
+    const parsed = JSON.parse(s);
+    return parsed != null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    const i = s.indexOf("{");
+    const j = s.lastIndexOf("}");
+    if (i < 0 || j <= i) return null;
+    try {
+      const parsed = JSON.parse(s.slice(i, j + 1));
+      return parsed != null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 function normalizeIntent(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
   const hit = INTENTS.find((i) => i.toLowerCase() === s);
@@ -55,12 +86,18 @@ function normalizeIntent(raw) {
 }
 
 /**
- * Klasifikasi intent memakai kutipan basis pengetahuan dari RAG (definisi intent + contoh di Pinecone).
+ * Klasifikasi intent memakai kutipan pengetahuan (RAG atau panduan statis INTENT_CLASSIFIER_GUIDE).
  * @param {string} apiKey — Gemini
  * @param {string[]} userTexts — baris pesan user
- * @param {string} intentKnowledgeFromRag — teks konteks dari retrieveProductRagContext / fallback panduan
+ * @param {string} intentKnowledgeFromRag — teks konteks dari retrieveProductRagContext / INTENT_CLASSIFIER_GUIDE
+ * @param {{ source?: string }} [options] — mis. `{ source: "gemini_only" }` untuk logging
  */
-export async function classifyIntent(apiKey, userTexts, intentKnowledgeFromRag) {
+export async function classifyIntent(
+  apiKey,
+  userTexts,
+  intentKnowledgeFromRag,
+  options = {},
+) {
   const lines = userTexts.filter(Boolean).map((t) => sanitizeAndCapTokens(t, 200));
   const combined = lines.join("\n");
   const promptBody = sanitizeAndCapTokens(combined, 400);
@@ -89,16 +126,16 @@ Aturan keluaran:
 Pesan user:
 ${promptBody}`;
 
+  const outSource = options.source ?? "rag_classifier";
+
   const result = await withGeminiRetry(() => model.generateContent(prompt));
   const text = result.response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { intent: "unknown", rawModelText: text, source: "rag_classifier" };
+  const parsed = parseJsonObjectFromModelText(text);
+  if (!parsed || !("intent" in parsed)) {
+    return { intent: "unknown", rawModelText: text, source: outSource };
   }
   const intent = normalizeIntentForRouting(normalizeIntent(parsed.intent));
-  return { intent, rawModelText: text, source: "rag_classifier" };
+  return { intent, rawModelText: text, source: outSource };
 }
 
 const THEME_HINT = UPLOAD_THEME_OPTIONS.map((o) => `${o.id}: ${o.label}`).join("; ");
@@ -148,20 +185,19 @@ HANYA JSON valid, tanpa markdown:
 
   const result = await withGeminiRetry(() => model.generateContent(prompt));
   const text = result.response.text();
-  try {
-    const parsed = JSON.parse(text);
-    const themeStyle =
-      parsed.themeStyle != null && String(parsed.themeStyle).trim()
-        ? String(parsed.themeStyle).trim()
-        : null;
-    const bannerText =
-      parsed.bannerText != null && String(parsed.bannerText).trim()
-        ? String(parsed.bannerText).trim()
-        : null;
-    return { themeStyle, bannerText, rawModelText: text };
-  } catch {
+  const parsed = parseJsonObjectFromModelText(text);
+  if (!parsed) {
     return { themeStyle: null, bannerText: null, rawModelText: text };
   }
+  const themeStyle =
+    parsed.themeStyle != null && String(parsed.themeStyle).trim()
+      ? String(parsed.themeStyle).trim()
+      : null;
+  const bannerText =
+    parsed.bannerText != null && String(parsed.bannerText).trim()
+      ? String(parsed.bannerText).trim()
+      : null;
+  return { themeStyle, bannerText, rawModelText: text };
 }
 
 /**
