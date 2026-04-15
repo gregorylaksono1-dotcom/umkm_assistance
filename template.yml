@@ -169,18 +169,46 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  GenerationRequestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: generation_request
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: generationId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: generationId
+          KeyType: HASH
+        - AttributeName: userId
+          KeyType: RANGE
+
+  GenerationConfirmIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: generation_confirm_idempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+
   ProcessIntentFunction:
     Type: AWS::Serverless::Function
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
-        Minify: true
+        # Minify + esbuild merusak class AWS SDK v3 / lib-dynamodb (GetCommand, TransactWrite, …)
+        Minify: false
         Target: es2022
         Sourcemap: false
         Format: cjs
         EntryPoints:
           - src/processIntent/index.js
-        External: []
     Properties:
       FunctionName: !Sub "${AWS::StackName}-process-intent"
       Handler: index.handler
@@ -192,6 +220,8 @@ Resources:
           TABLE_SENDER_META: !Ref SenderMetaTable
           TABLE_BILLING_USAGE_CREDIT: !Ref BillingUsageCreditTable
           TABLE_REQUEST_RESOURCE: !Ref RequestResourceTable
+          TABLE_GENERATION_REQUEST: !Ref GenerationRequestTable
+          TABLE_GENERATION_CONFIRM_IDEMPOTENCY: !Ref GenerationConfirmIdempotencyTable
           GSI_REQUEST_USER_PROCESS: userProcess
           UPLOAD_S3_BUCKET: !Ref UploadS3Bucket
           GEMINI_SECRET_ARN: !Ref GeminiSecretArn
@@ -219,6 +249,8 @@ Resources:
                 - dynamodb:Query
                 - dynamodb:UpdateItem
                 - dynamodb:PutItem
+                - dynamodb:DeleteItem
+                - dynamodb:TransactWriteItems
               Resource:
                 - !GetAtt MessageTable.Arn
                 - !Sub "${MessageTable.Arn}/index/*"
@@ -226,6 +258,8 @@ Resources:
                 - !GetAtt BillingUsageCreditTable.Arn
                 - !GetAtt RequestResourceTable.Arn
                 - !Sub "${RequestResourceTable.Arn}/index/*"
+                - !GetAtt GenerationRequestTable.Arn
+                - !GetAtt GenerationConfirmIdempotencyTable.Arn
             - Effect: Allow
               Action:
                 - s3:PutObject
@@ -245,13 +279,12 @@ Resources:
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
-        Minify: true
+        Minify: false
         Target: es2022
         Sourcemap: false
         Format: cjs
         EntryPoints:
           - src/webhook/index.js
-        External: []
     Properties:
       FunctionName: !Sub "${AWS::StackName}-webhook"
       Handler: index.handler

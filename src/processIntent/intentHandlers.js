@@ -212,6 +212,8 @@ export async function handleUploadGambar(ctx) {
     ddb,
     tableRequestResource,
     tableBilling,
+    tableGenerationRequest,
+    tableGenerationConfirmIdempotency,
     senderId,
     chatId,
     provider,
@@ -222,6 +224,7 @@ export async function handleUploadGambar(ctx) {
     apiKey,
     intent,
     gsiRequestUserProcess,
+    triggerMessageId,
   } = ctx;
 
   if (!uploadGambarPath) return null;
@@ -240,6 +243,9 @@ export async function handleUploadGambar(ctx) {
     apiKey,
     classifiedIntent: intent,
     gsiUserProcess: gsiRequestUserProcess,
+    triggerMessageId,
+    tableGenerationRequest,
+    tableGenerationConfirmIdempotency,
   });
 
   if (!uploadOut.handled) return null;

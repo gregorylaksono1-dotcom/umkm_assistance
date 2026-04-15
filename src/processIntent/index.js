@@ -10,6 +10,9 @@ const pipelineDeps = {
   tableSenderMeta: process.env.TABLE_SENDER_META,
   tableBillingUsageCredit: process.env.TABLE_BILLING_USAGE_CREDIT,
   tableRequestResource: process.env.TABLE_REQUEST_RESOURCE,
+  tableGenerationRequest: process.env.TABLE_GENERATION_REQUEST,
+  tableGenerationConfirmIdempotency:
+    process.env.TABLE_GENERATION_CONFIRM_IDEMPOTENCY,
   midtransSecretArn: process.env.MIDTRANS_SECRET_ARN,
   geminiSecretArn: process.env.GEMINI_SECRET_ARN,
   geminiSecretKey: process.env.GEMINI_SECRET_KEY ?? "gemini_api_key",

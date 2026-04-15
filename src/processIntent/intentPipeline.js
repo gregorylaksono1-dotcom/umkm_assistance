@@ -18,7 +18,13 @@ import {
   INTENT_UNKNOWN,
   INTENT_UPLOAD_GAMBAR,
   LLM_UNAVAILABLE_REPLY_TEXT,
+  normalizeIntentForRouting,
 } from "../shared/constants.js";
+import {
+  detectIntentFinalHeuristic,
+  pickTriggerWindowItem,
+  windowItemToDetectMessage,
+} from "../shared/detectIntentFinal.js";
 import {
   isActiveUploadDraft,
   queryOpenRequestForUser,
@@ -43,32 +49,9 @@ const INTENTS_ALLOWED_DURING_UPLOAD_DRAFT = new Set([
   INTENT_PROCESS_IMAGE_CONFIRMED,
 ]);
 
-/**
- * Deteksi konfirmasi singkat sebelum RAG / Gemini classifier (hemat latency & biaya).
- * @param {string|null|undefined} text
- * @returns {typeof INTENT_PROCESS_IMAGE_CONFIRMED|null}
- */
-function detectShortConfirm(text) {
-  const t = String(text ?? "").trim().toLowerCase();
-
-  if (["ya", "ok", "oke", "setuju"].includes(t)) {
-    return INTENT_PROCESS_IMAGE_CONFIRMED;
-  }
-  if(
-    text.includes("mau edit") ||
-    text.includes("ingin edit") ||
-    text.includes("mau upload")
-  ) {
-    return INTENT_TANYA_INFO;
-  }
-
-  return null;
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 /**
  * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} ddb
  * @param {string} tableMessage
@@ -364,7 +347,8 @@ function logIntentResolution(p) {
     classifyLines,
     productRagContextForReply,
     classified,
-    skippedRagForShortConfirm,
+    skippedRagForShortcut,
+    intentFinalHeuristicSource,
   } = p;
   console.log("intent_rag_resolution", {
     finalIntent: intent,
@@ -372,7 +356,8 @@ function logIntentResolution(p) {
     vectorIntent: ragResult?.vectorIntent ?? null,
     usedVectorFallback,
     usedKnowledgeRag: intent === INTENT_TANYA_INFO,
-    skippedRagForShortConfirm: Boolean(skippedRagForShortConfirm),
+    skippedRagForShortcut: Boolean(skippedRagForShortcut),
+    intentFinalHeuristicSource: intentFinalHeuristicSource ?? null,
     classifyLinesPreview: classifyLines
       .join(" | ")
       .replace(/\s+/g, " ")
@@ -422,6 +407,8 @@ export async function runIntentProcessingPipeline(deps, event) {
     tableSenderMeta,
     tableBillingUsageCredit,
     tableRequestResource,
+    tableGenerationRequest,
+    tableGenerationConfirmIdempotency,
     midtransSecretArn,
     geminiSecretArn,
     geminiSecretKey,
@@ -469,26 +456,63 @@ export async function runIntentProcessingPipeline(deps, event) {
   try {
     const apiKey = await getGeminiApiKey(geminiSecretArn, geminiSecretKey);
 
-    const lastUserLine = classifyLines[classifyLines.length - 1] ?? "";
-    const shortConfirmIntent = detectShortConfirm(lastUserLine);
+    let openDraft = null;
+    if (tableRequestResource && chatId != null && senderId) {
+      openDraft = await queryOpenRequestForUser(
+        ddb,
+        tableRequestResource,
+        gsiRequestUserProcess,
+        senderId,
+      );
+    }
+    const session =
+      openDraft &&
+      String(openDraft.chatId ?? "") === String(chatId) &&
+      isActiveUploadDraft(openDraft)
+        ? { state: "waiting_instruction" }
+        : {};
+
+    const triggerItem = pickTriggerWindowItem(windowItems, triggerMessageId);
+    const message = windowItemToDetectMessage(triggerItem);
+    const heuristicResult = detectIntentFinalHeuristic(message, session);
 
     let ragResult = null;
-    /** @type {{ intent?: string, rawModelText?: string, source?: string }} */
+    /** @type {{ intent?: string, rawModelText?: string, source?: string, heuristicSource?: string }} */
     let classified = { rawModelText: "" };
     let geminiIntent;
     let usedVectorFallback = false;
-    let skippedRagForShortConfirm = false;
+    let skippedRagForShortcut = false;
+    /** @type {string|undefined} */
+    let intentFinalHeuristicSource;
 
-    if (shortConfirmIntent) {
-      skippedRagForShortConfirm = true;
-      intent = shortConfirmIntent;
-      geminiIntent = shortConfirmIntent;
+    if (heuristicResult) {
+      skippedRagForShortcut = true;
+      intentFinalHeuristicSource = heuristicResult.source;
+      intent = normalizeIntentForRouting(heuristicResult.intent);
+      geminiIntent = intent;
       classified = {
-        intent: shortConfirmIntent,
+        intent,
         rawModelText: "",
-        source: "short_confirm",
+        source: "intent_final_heuristic",
+        heuristicSource: heuristicResult.source,
       };
       productRagContextForReply = null;
+
+      if (intent === INTENT_TANYA_INFO) {
+        try {
+          const knCfg = ragKnowledgeConfigFromEnv();
+          const knCreds = await loadRagCredentials(knCfg);
+          const knResult = await retrieveProductRagContext(
+            classifyLines.join("\n"),
+            knCreds,
+            { phase: "knowledge" },
+          );
+          productRagContextForReply = knResult.context;
+        } catch (knErr) {
+          console.warn("knowledge_rag_heuristic_tanya_info", knErr);
+          productRagContextForReply = null;
+        }
+      }
     } else {
       const ragOut = await runIntentRagAndClassifier(apiKey, classifyLines);
       ragResult = ragOut.ragResult;
@@ -530,7 +554,8 @@ export async function runIntentProcessingPipeline(deps, event) {
       classifyLines,
       productRagContextForReply,
       classified,
-      skippedRagForShortConfirm,
+      skippedRagForShortcut,
+      intentFinalHeuristicSource,
     });
 
     const canTelegram =
@@ -556,12 +581,15 @@ export async function runIntentProcessingPipeline(deps, event) {
       chatId,
       provider,
       senderId,
+      triggerMessageId,
       canTelegram,
       replyTelegram,
       productRagContextForReply,
       midtransSecretArn,
       tableBilling: tableBillingUsageCredit,
       tableRequestResource,
+      tableGenerationRequest,
+      tableGenerationConfirmIdempotency,
       gsiRequestUserProcess,
       uploadGambarPath: routes.uploadGambarPath,
       bannerIntentWithImage: routes.bannerIntentWithImage,

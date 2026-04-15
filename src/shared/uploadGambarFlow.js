@@ -3,7 +3,6 @@ import {
   GetCommand,
   PutCommand,
   QueryCommand,
-  UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import {
@@ -13,12 +12,12 @@ import {
   UPLOAD_S3_BUCKET_DEFAULT,
   UPLOAD_THEME_OPTIONS,
 } from "./constants.js";
+import { ensureBillingProfile } from "./creditProfile.js";
 import {
-  billingUserPk,
-  BILLING_PROFILE_SK,
-  decrementPaidCredit,
-  ensureBillingProfile,
-} from "./creditProfile.js";
+  buildGenerationConfirmIdempotencyKey,
+  getGenerationConfirmIdempotency,
+  transactSubmitGenerationRequest,
+} from "./generationRequestSubmit.js";
 import { extractUploadGambarSlots } from "./gemini.js";
 import { userSaysReadyToProcess } from "./bannerFlow.js";
 
@@ -314,16 +313,24 @@ export async function queryOpenRequestForUser(ddb, tableName, gsiName, userId) {
  */
 export function isActiveUploadDraft(resource) {
   if (!resource || resource.isProcess === true) return false;
-  const hasImg =
-    (Array.isArray(resource.pendingImageEntries) &&
-      resource.pendingImageEntries.length > 0) ||
-    (Array.isArray(resource.s3Keys) && resource.s3Keys.length > 0);
-  const hasTheme = Boolean(resource.theme && String(resource.theme).trim());
+  if (isStalePostJobResourceRow(resource)) return false;
+
+  const pendingLen = Array.isArray(resource.pendingImageEntries)
+    ? resource.pendingImageEntries.length
+    : 0;
+  if (pendingLen > 0) return true;
+
+  const snapshotShown =
+    resource.confirmSnapshotShown != null &&
+    String(resource.confirmSnapshotShown).trim().length > 0;
   const awaiting =
-    resource.awaitingUserConfirm === true ||
-    (resource.confirmSnapshotShown != null &&
-      String(resource.confirmSnapshotShown).trim().length > 0);
-  return hasImg || hasTheme || awaiting;
+    awaitingUserConfirmIsTrue(resource) ||
+    (!awaitingUserConfirmIsExplicitlyFalse(resource) && snapshotShown);
+
+  const hasImg = Array.isArray(resource.s3Keys) && resource.s3Keys.length > 0;
+
+  /** Tema/banner saja tanpa pending gambar & tanpa tunggu konfirmasi bukan alasan blok (sisa job / extract LLM). */
+  return hasImg || awaiting;
 }
 
 /**
@@ -347,23 +354,6 @@ function applyGsiKeys(resource) {
   const uid = String(resource.userId ?? "");
   resource.resourceUserId = uid;
   resource.resourceIsProcessKey = resource.isProcess === true ? GSI_TRUE : GSI_FALSE;
-}
-
-async function decrementFreeCredit(ddb, tableBilling, senderId) {
-  const pk = billingUserPk(senderId);
-  await ddb.send(
-    new UpdateCommand({
-      TableName: tableBilling,
-      Key: { PK: pk, SK: BILLING_PROFILE_SK },
-      UpdateExpression: "ADD free_credit :dec SET updatedAt = :ua",
-      ConditionExpression: "free_credit >= :one",
-      ExpressionAttributeValues: {
-        ":dec": -1,
-        ":one": 1,
-        ":ua": Date.now(),
-      },
-    }),
-  );
 }
 
 async function downloadTelegramFile(token, fileId) {
@@ -403,6 +393,25 @@ function buildSnapshot(resource) {
   });
 }
 
+/** Bool dari Dynamo; CSV/import kadang jadi string. */
+function awaitingUserConfirmIsTrue(row) {
+  const v = row?.awaitingUserConfirm;
+  if (v === true) return true;
+  if (typeof v === "string" && ["true", "1"].includes(v.toLowerCase().trim())) {
+    return true;
+  }
+  return false;
+}
+
+function awaitingUserConfirmIsExplicitlyFalse(row) {
+  const v = row?.awaitingUserConfirm;
+  if (v === false) return true;
+  if (typeof v === "string" && ["false", "0"].includes(v.toLowerCase().trim())) {
+    return true;
+  }
+  return false;
+}
+
 /** Job sudah dikonfirmasi & diproses (bukan draft terbuka). */
 function rowIsProcessCompleted(row) {
   if (!row) return false;
@@ -410,6 +419,30 @@ function rowIsProcessCompleted(row) {
   if (row.resourceIsProcessKey === GSI_TRUE) return true;
   const v = String(row.isProcess ?? "").toLowerCase();
   return v === "true" || v === "1";
+}
+
+/**
+ * Baris sisa setelah job diproses: isProcess sudah false tapi field draft/upload masih menempel
+ * (worker / TTL tidak mereset). Bukan draft aktif — user boleh intent lain & tidak diblok gate.
+ */
+function isStalePostJobResourceRow(row) {
+  if (!row || row.isProcess === true) return false;
+  if (awaitingUserConfirmIsTrue(row)) return false;
+  const pendingLen = Array.isArray(row.pendingImageEntries)
+    ? row.pendingImageEntries.length
+    : 0;
+  if (pendingLen > 0) return false;
+  if (row.jobKind != null && String(row.jobKind).trim() !== "") return true;
+  const s3Len = Array.isArray(row.s3Keys) ? row.s3Keys.length : 0;
+  if (s3Len > 0) return true;
+  if (
+    awaitingUserConfirmIsExplicitlyFalse(row) &&
+    row.confirmSnapshotShown != null &&
+    String(row.confirmSnapshotShown).trim().length > 0
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -488,6 +521,12 @@ async function loadOrCreateDraftResource({
     return row;
   }
 
+  if (isStalePostJobResourceRow(row)) {
+    row = resetDraftOnCompletedRow(row, bucket, now);
+    await persistResource(ddb, table, row);
+    return row;
+  }
+
   if (rowIsProcessCompleted(row)) {
     return resetDraftOnCompletedRow(row, bucket, now);
   }
@@ -514,6 +553,9 @@ async function persistResource(ddb, table, resource) {
 /**
  * @param {object} opts
  * @param {string} [opts.jobKind]
+ * @param {string} [opts.triggerMessageId] — untuk idempotensi confirm (payload process-intent)
+ * @param {string} [opts.tableGenerationRequest]
+ * @param {string} [opts.tableGenerationConfirmIdempotency]
  */
 export async function runUploadGambarFlow(opts) {
   const {
@@ -531,6 +573,9 @@ export async function runUploadGambarFlow(opts) {
     classifiedIntent,
     gsiUserProcess,
     jobKind: jobKindOpt,
+    triggerMessageId: triggerMessageIdOpt,
+    tableGenerationRequest,
+    tableGenerationConfirmIdempotency,
   } = opts;
 
   if (!apiKey) {
@@ -778,6 +823,58 @@ export async function runUploadGambarFlow(opts) {
       }
     }
 
+    const triggerMessageId = String(
+      triggerMessageIdOpt ??
+        windowItems[windowItems.length - 1]?.messageId ??
+        "",
+    ).trim();
+    if (
+      !tableGenerationRequest ||
+      !tableGenerationConfirmIdempotency ||
+      !triggerMessageId
+    ) {
+      console.error("generation_submit_config_missing", {
+        hasGenTable: Boolean(tableGenerationRequest),
+        hasIdemTable: Boolean(tableGenerationConfirmIdempotency),
+        triggerMessageId: triggerMessageId || null,
+      });
+      if (canTelegram && chatId) {
+        await replyTelegram(
+          chatId,
+          "Maaf kak, sistem generasi belum dikonfigurasi. Hubungi admin ya.",
+        );
+      }
+      return { handled: true, error: "generation_submit_config_missing" };
+    }
+
+    const idemKey = buildGenerationConfirmIdempotencyKey(
+      senderId,
+      triggerMessageId,
+    );
+    const existingGen = await getGenerationConfirmIdempotency(
+      ddb,
+      tableGenerationConfirmIdempotency,
+      idemKey,
+    );
+    if (existingGen) {
+      console.log("process_image_confirmed_duplicate", {
+        generationId: existingGen.generationId,
+        senderId: String(senderId),
+        triggerMessageId,
+      });
+      if (canTelegram && chatId) {
+        await replyTelegram(
+          chatId,
+          "Permintaan ini sudah kami terima sebelumnya dan sedang / sudah diproses ya kak.",
+        );
+      }
+      return {
+        handled: true,
+        duplicate_confirm: true,
+        generationId: existingGen.generationId,
+      };
+    }
+
     const s3Keys = [];
     try {
       for (const ent of resource.pendingImageEntries) {
@@ -808,45 +905,71 @@ export async function runUploadGambarFlow(opts) {
       return { handled: true, error: "upload_failed" };
     }
 
+    const usePaidCredit = jobKind === "banner" || paid;
+    let generationId;
     try {
-      if (jobKind === "banner" || paid) {
-        await decrementPaidCredit(ddb, tableBilling, senderId);
-      } else {
-        await decrementFreeCredit(ddb, tableBilling, senderId);
-      }
+      const out = await transactSubmitGenerationRequest({
+        ddb,
+        tableGenerationRequest,
+        tableIdempotency: tableGenerationConfirmIdempotency,
+        tableRequestResource,
+        tableBilling,
+        senderId,
+        chatId,
+        triggerMessageId,
+        provider,
+        bucket,
+        s3Keys,
+        theme: resource.theme,
+        bannerText: resource.bannerText ?? resource.caption ?? undefined,
+        usePaidCredit,
+      });
+      generationId = out.generationId;
     } catch (e) {
-      console.error("billing_decrement_failed", e);
+      const reasons = e?.CancellationReasons ?? e?.cancellationReasons ?? [];
+      const hasConditionalFail = reasons.some(
+        (r) =>
+          (r?.Code ?? r?.code) === "ConditionalCheckFailed",
+      );
+      if (e?.name === "TransactionCanceledException" && hasConditionalFail) {
+        const dup = await getGenerationConfirmIdempotency(
+          ddb,
+          tableGenerationConfirmIdempotency,
+          idemKey,
+        );
+        if (dup && canTelegram && chatId) {
+          await replyTelegram(
+            chatId,
+            "Permintaan ini sudah kami terima sebelumnya dan sedang / sudah diproses ya kak.",
+          );
+        }
+        return {
+          handled: true,
+          duplicate_confirm: true,
+          generationId: dup?.generationId,
+        };
+      }
+      console.error("generation_submit_transact_failed", e);
       if (canTelegram && chatId) {
         await replyTelegram(
           chatId,
-          "Maaf kak, saldo tidak cukup atau gagal mengurangi kredit. Coba cek saldo ya.",
+          "Maaf kak, saldo tidak cukup atau gagal menyimpan permintaan. Coba cek saldo ya.",
         );
       }
-      return { handled: true, error: "billing_decrement_failed" };
+      return { handled: true, error: "generation_submit_failed" };
     }
 
-    resource.s3Keys = s3Keys;
-    resource.pendingImageEntries = [];
-    resource.isProcess = true;
-    resource.jobKind = jobKind;
-    resource.awaitingUserConfirm = false;
-    resource.confirmSnapshotShown = undefined;
-    applyGsiKeys(resource);
-    resource.updatedAt = Date.now();
-
-    await persistResource(ddb, tableRequestResource, resource);
-
     console.log("process_image_confirmed", {
-      stage: "after_s3_and_billing",
+      stage: "after_s3_and_generation_transact",
       intent: INTENT_PROCESS_IMAGE_CONFIRMED,
       chatId: String(chatId),
       userId: String(senderId),
       bucket,
-      s3Keys: resource.s3Keys,
+      s3Keys,
       theme: resource.theme,
       bannerText: resource.bannerText ?? null,
       jobKind,
-      isProcess: resource.isProcess,
+      generationId,
     });
 
     if (canTelegram && chatId) {
@@ -855,7 +978,7 @@ export async function runUploadGambarFlow(opts) {
         "Siap kak! Permintaan sudah dikonfirmasi dan kami proses sesuai ringkasan tadi.",
       );
     }
-    return { handled: true, confirmed: true, jobKind };
+    return { handled: true, confirmed: true, jobKind, generationId };
   }
 
   if (!resource.awaitingUserConfirm) {

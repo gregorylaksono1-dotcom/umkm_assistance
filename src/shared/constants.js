@@ -28,6 +28,9 @@ export const INTENT_LIST_PROMPT = INTENTS.map((i) => `- ${i}`).join("\n");
 
 export const INTENT_BUATKAN_BANNER = "buatkan banner";
 
+/** Minta teks promo / copywriting (bukan desain gambar). */
+export const INTENT_BUATKAN_PROMO_TEXT = "buatkan_promo_text";
+
 export const INTENT_SALAM = "salam";
 
 export const INTENT_BELI_CREDIT = "beli_credit";
@@ -56,6 +59,7 @@ export function normalizeIntentForRouting(intent) {
     ["cek_kredit", "cek kredit"],
     ["buatkan_banner", INTENT_BUATKAN_BANNER],
     ["buatkan banner", INTENT_BUATKAN_BANNER],
+    ["buatkan_promo_text", INTENT_BUATKAN_PROMO_TEXT],
   ]);
   if (aliases.has(lower)) return aliases.get(lower);
   const under = lower.replace(/\s+/g, "_");
@@ -72,6 +76,7 @@ export const MIN_CREDIT_PURCHASE = 10;
 /** Intent info produk: jawaban dari RAG (Pinecone) + Gemini, bukan markdown statis. */
 export const PRODUCT_RAG_INTENTS = new Set([
   INTENT_TANYA_INFO,
+  INTENT_BUATKAN_PROMO_TEXT,
   "tanya_harga",
   "tanya_fitur",
   "tanya_keuntungan",
