@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Telegram/WhatsApp webhook, DynamoDB message store, Gemini2.0 Flash-Lite intent.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures:
+      - arm64
+    Timeout: 60
+    MemorySize: 256
+    Tracing: Active
+
+Parameters:
+  GeminiSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:gemini_llm-aoFcff
+    Description: ARN Secrets Manager JSON yang berisi gemini_api_key.
+  GeminiSecretKeyName:
+    Type: String
+    Default: gemini_api_key
+  MidtransSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:midtrans_secret-gbnBcs
+    Description: ARN Secrets Manager JSON (server_key/secret_key + client_key Midtrans).
+  OpenAiSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:open_ai-wCZYqC
+    Description: ARN Secrets Manager JSON OpenAI (field secret_key untuk API key).
+  OpenAiSecretKeyName:
+    Type: String
+    Default: secret_key
+  PineconeIntentSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:pinecone_intent-vrrXfk
+    Description: ARN Secrets Manager JSON Pinecone indeks intent (klasifikasi).
+  PineconeKnowledgeSecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:pinecone_knowledge-gmKBwP
+    Description: ARN Secrets Manager JSON Pinecone indeks pengetahuan (jawaban tanya_info).
+  PineconeHost:
+    Type: String
+    Default: ""
+    Description: Host data plane Pinecone (https://....pinecone.io). Kosongkan jika pakai field host di secret.
+  PineconeNamespace:
+    Type: String
+    Default: ""
+  UploadS3Bucket:
+    Type: String
+    Default: dapurartisan
+    Description: Bucket S3 untuk menyimpan unggahan foto (INTENT_UPLOAD_GAMBAR).
+  RagTopK:
+    Type: Number
+    Default: 8
+  MidtransIsProduction:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: true = Midtrans production API; false = sandbox.
+  DebounceMs:
+    Type: Number
+    Default: 3000
+    Description: Jeda (ms) sebelum menggabungkan pesan beruntun dari pengirim yang sama.
+  TelegramBotToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Opsional — untuk membalas ke Telegram setelah intent terklasifikasi.
+  WhatsAppVerifyToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Token verifikasi Meta (hub.verify_token) untuk GET /webhook/whatsapp.
+
+Conditions:
+  HasTelegramToken: !Not [!Equals [!Ref TelegramBotToken, ""]]
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  MessageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: message
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S
+        - AttributeName: senderId
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: N
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH
+        - AttributeName: senderId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  SenderMetaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sender_meta
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: senderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: senderId
+          KeyType: HASH
+
+  BillingUsageCreditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: billing_usage_credit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  RequestResourceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: request_resource
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: chatId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: resourceUserId
+          AttributeType: S
+        - AttributeName: resourceIsProcessKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: chatId
+          KeyType: HASH
+        - AttributeName: userId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: userProcess
+          KeySchema:
+            - AttributeName: resourceUserId
+              KeyType: HASH
+            - AttributeName: resourceIsProcessKey
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ProcessIntentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        Format: cjs
+        EntryPoints:
+          - src/processIntent/index.js
+        External: []
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-intent"
+      Handler: index.handler
+      CodeUri: .
+      Timeout: 90
+      Environment:
+        Variables:
+          TABLE_MESSAGE: !Ref MessageTable
+          TABLE_SENDER_META: !Ref SenderMetaTable
+          TABLE_BILLING_USAGE_CREDIT: !Ref BillingUsageCreditTable
+          TABLE_REQUEST_RESOURCE: !Ref RequestResourceTable
+          GSI_REQUEST_USER_PROCESS: userProcess
+          UPLOAD_S3_BUCKET: !Ref UploadS3Bucket
+          GEMINI_SECRET_ARN: !Ref GeminiSecretArn
+          GEMINI_SECRET_KEY: !Ref GeminiSecretKeyName
+          OPENAI_SECRET_ARN: !Ref OpenAiSecretArn
+          OPENAI_SECRET_KEY_NAME: !Ref OpenAiSecretKeyName
+          PINECONE_INTENT_SECRET_ARN: !Ref PineconeIntentSecretArn
+          PINECONE_KNOWLEDGE_SECRET_ARN: !Ref PineconeKnowledgeSecretArn
+          PINECONE_HOST: !Ref PineconeHost
+          PINECONE_NAMESPACE: !Ref PineconeNamespace
+          RAG_TOP_K: !Ref RagTopK
+          MIDTRANS_SECRET_ARN: !Ref MidtransSecretArn
+          MIDTRANS_IS_PRODUCTION: !Ref MidtransIsProduction
+          GSI_SENDER_TIME: GSI1
+          TELEGRAM_BOT_TOKEN: !If [HasTelegramToken, !Ref TelegramBotToken, ""]
+          TELEGRAM_UNKNOWN_NOTIFY_CHAT_ID: "7989331780"
+          ADMIN_EMAIL: "admin@arbcelebes.com"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+                - dynamodb:PutItem
+              Resource:
+                - !GetAtt MessageTable.Arn
+                - !Sub "${MessageTable.Arn}/index/*"
+                - !GetAtt SenderMetaTable.Arn
+                - !GetAtt BillingUsageCreditTable.Arn
+                - !GetAtt RequestResourceTable.Arn
+                - !Sub "${RequestResourceTable.Arn}/index/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${UploadS3Bucket}/*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GeminiSecretArn
+                - !Ref MidtransSecretArn
+                - !Ref OpenAiSecretArn
+                - !Ref PineconeIntentSecretArn
+                - !Ref PineconeKnowledgeSecretArn
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        Format: cjs
+        EntryPoints:
+          - src/webhook/index.js
+        External: []
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-webhook"
+      Handler: index.handler
+      CodeUri: .
+      Environment:
+        Variables:
+          TABLE_MESSAGE: !Ref MessageTable
+          TABLE_SENDER_META: !Ref SenderMetaTable
+          TABLE_BILLING_USAGE_CREDIT: !Ref BillingUsageCreditTable
+          MIDTRANS_SECRET_ARN: !Ref MidtransSecretArn
+          PROCESS_INTENT_ARN: !GetAtt ProcessIntentFunction.Arn
+          DEBOUNCE_MS: !Ref DebounceMs
+          WHATSAPP_VERIFY_TOKEN: !Ref WhatsAppVerifyToken
+          TELEGRAM_BOT_TOKEN: !If [HasTelegramToken, !Ref TelegramBotToken, ""]
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt MessageTable.Arn
+                - !GetAtt SenderMetaTable.Arn
+                - !GetAtt BillingUsageCreditTable.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref MidtransSecretArn
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ProcessIntentFunction.Arn
+      Events:
+        Telegram:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /webhook/telegram
+            Method: POST
+        WhatsApp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /webhook/whatsapp
+            Method: POST
+        WhatsAppVerify:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /webhook/whatsapp
+            Method: GET
+        MidtransPayment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /webhook/midtrans
+            Method: POST
+
+Outputs:
+  HttpApiUrl:
+    Description: Base URL HTTP API
+    Value: !GetAtt HttpApi.ApiEndpoint
+  TelegramWebhookUrl:
+    Description: Set Telegram setWebhook ke URL ini
+    Value: !Join ["", [!GetAtt HttpApi.ApiEndpoint, "/webhook/telegram"]]
+  WhatsAppWebhookUrl:
+    Description: URL verifikasi / webhook WhatsApp Cloud API
+    Value: !Join ["", [!GetAtt HttpApi.ApiEndpoint, "/webhook/whatsapp"]]
+  MidtransNotificationUrl:
+    Description: URL HTTP notification Midtrans (Payment Notification)
+    Value: !Join ["", [!GetAtt HttpApi.ApiEndpoint, "/webhook/midtrans"]]

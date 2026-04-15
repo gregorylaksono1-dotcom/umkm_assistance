@@ -1,0 +1,19 @@
+{
+  "name": "umkm-messaging-intent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/client-dynamodb": "^3.758.0",
+    "@aws-sdk/client-lambda": "^3.758.0",
+    "@aws-sdk/client-secrets-manager": "^3.758.0",
+    "@aws-sdk/lib-dynamodb": "^3.758.0",
+    "@google/generative-ai": "^0.21.0",
+    "esbuild": "^0.25.0",
+    "midtrans-client": "^1.4.3"
+  }
+}

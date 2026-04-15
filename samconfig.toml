@@ -1,0 +1,28 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "umkm-messaging-intent"
+region = "ap-southeast-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+
+[default.build.parameters]
+cached = true
+parallel = true
+# Source template; do not put this in global — deploy must use .aws-sam/build output.
+template_file = "template.yml"
+
+[default.deploy.parameters]
+stack_name = "umkm-messaging-intent"
+region = "ap-southeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+# Required: source template.yml leaves CodeUri as "." so the zip has no index.js at root.
+template_file = ".aws-sam/build/template.yaml"
+parameter_overrides = [
+  "GeminiSecretArn=arn:aws:secretsmanager:ap-southeast-1:084375570459:secret:gemini_llm-aoFcff",
+  "DebounceMs=3000",
+  "TelegramBotToken=8277434028:AAFcwRFzdtOAmx2tn8Cal1d1ZFwwcAmP0dI",
+]
