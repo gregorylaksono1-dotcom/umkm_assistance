@@ -130,3 +130,79 @@ export async function decrementPaidCredit(ddb, tableName, senderId) {
     }),
   );
 }
+
+/**
+ * Kurangi 1 slot free_credit (profil harus sudah punya atribut free_credit).
+ */
+export async function decrementFreeCredit(ddb, tableName, senderId) {
+  const pk = billingUserPk(senderId);
+  await ddb.send(
+    new UpdateCommand({
+      TableName: tableName,
+      Key: { PK: pk, SK: BILLING_PROFILE_SK },
+      UpdateExpression: "ADD free_credit :dec SET updatedAt = :ua",
+      ConditionExpression: "free_credit >= :one",
+      ExpressionAttributeValues: {
+        ":dec": -1,
+        ":one": 1,
+        ":ua": Date.now(),
+      },
+    }),
+  );
+}
+
+/**
+ * Satu permintaan gambar/video: potong 1 dari `credits` berbayar bila cukup,
+ * kalau tidak coba `free_credit`.
+ *
+ * @returns {Promise<{ kind: "ok", source: "paid" | "free" } | { kind: "insufficient" }>}
+ */
+export async function consumeOneMediaCredit(ddb, tableName, senderId) {
+  try {
+    await decrementPaidCredit(ddb, tableName, senderId);
+    return { kind: "ok", source: "paid" };
+  } catch (e) {
+    if (e?.name !== "ConditionalCheckFailedException") throw e;
+  }
+  try {
+    await decrementFreeCredit(ddb, tableName, senderId);
+    return { kind: "ok", source: "free" };
+  } catch (e) {
+    if (e?.name !== "ConditionalCheckFailedException") throw e;
+  }
+  return { kind: "insufficient" };
+}
+
+/**
+ * Kembalikan 1 credit media bila langkah setelah `consumeOneMediaCredit` gagal.
+ * @param {"paid"|"free"} source
+ */
+export async function refundOneMediaCredit(ddb, tableName, senderId, source) {
+  const pk = billingUserPk(senderId);
+  const now = Date.now();
+  if (source === "paid") {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: tableName,
+        Key: { PK: pk, SK: BILLING_PROFILE_SK },
+        UpdateExpression: "ADD credits :inc SET updatedAt = :ua",
+        ExpressionAttributeValues: {
+          ":inc": 1,
+          ":ua": now,
+        },
+      }),
+    );
+    return;
+  }
+  await ddb.send(
+    new UpdateCommand({
+      TableName: tableName,
+      Key: { PK: pk, SK: BILLING_PROFILE_SK },
+      UpdateExpression: "ADD free_credit :inc SET updatedAt = :ua",
+      ExpressionAttributeValues: {
+        ":inc": 1,
+        ":ua": now,
+      },
+    }),
+  );
+}

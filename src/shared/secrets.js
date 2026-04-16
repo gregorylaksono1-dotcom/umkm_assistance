@@ -5,9 +5,6 @@ import {
 
 const client = new SecretsManagerClient({});
 
-let cachedKey = null;
-let cacheExpires = 0;
-
 const jsonSecretCache = new Map();
 
 export async function getJsonSecret(secretArn) {
@@ -34,27 +31,34 @@ export async function getJsonSecret(secretArn) {
   return parsed;
 }
 
-export async function getGeminiApiKey(secretArn, secretKeyName) {
-  const now = Date.now();
-  if (cachedKey && now < cacheExpires) return cachedKey;
+let geminiKeyCache = { key: null, arn: "", name: "", expires: 0 };
 
-  const out = await client.send(
-    new GetSecretValueCommand({ SecretId: secretArn }),
-  );
-  const raw =
-    out.SecretString ??
-    (out.SecretBinary ? Buffer.from(out.SecretBinary).toString("utf8") : "");
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("SecretString must be JSON with gemini_api_key");
+/**
+ * Ambil API key Gemini dari Secret JSON (field `secretKeyName`, default gemini_api_key).
+ * @param {string} secretArn
+ * @param {string} [secretKeyName]
+ */
+export async function getGeminiApiKey(secretArn, secretKeyName = "gemini_api_key") {
+  const now = Date.now();
+  if (
+    geminiKeyCache.key &&
+    geminiKeyCache.arn === secretArn &&
+    geminiKeyCache.name === secretKeyName &&
+    now < geminiKeyCache.expires
+  ) {
+    return geminiKeyCache.key;
   }
+
+  const parsed = await getJsonSecret(secretArn);
   const key = parsed[secretKeyName];
   if (!key || typeof key !== "string") {
     throw new Error(`Missing ${secretKeyName} in secret JSON`);
   }
-  cachedKey = key;
-  cacheExpires = now + 5 * 60 * 1000;
+  geminiKeyCache = {
+    key,
+    arn: secretArn,
+    name: secretKeyName,
+    expires: now + 5 * 60 * 1000,
+  };
   return key;
 }

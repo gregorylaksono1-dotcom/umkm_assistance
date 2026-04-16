@@ -1,8 +1,7 @@
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import Midtrans from "midtrans-client";
-import {
-  CREDIT_UNIT_PRICE_IDR,
-  MIN_CREDIT_PURCHASE,
-} from "./constants.js";
+import { CREDIT_UNIT_PRICE_IDR } from "./constants.js";
+import { billingUserPk } from "./creditProfile.js";
 import { getJsonSecret } from "./secrets.js";
 
 function midtransKeysFromSecret(parsed) {
@@ -16,50 +15,13 @@ function midtransKeysFromSecret(parsed) {
   return { serverKey: String(serverKey), clientKey: String(clientKey) };
 }
 
-/**
- * Ambil jumlah credit dari teks user (beberapa bubble digabung).
- * Utamakan pola eksplisit "N credit"; fallback angka tunggal di baris terakhir.
- */
-export function extractPurchaseCreditsFromUserLines(lines, minCredits = MIN_CREDIT_PURCHASE) {
-  const joined = lines.join(" ").toLowerCase();
-  const fromExplicit = [];
-  const reCredit = /(\d{1,6})\s*(?:credit|credits|kredit)\b/gi;
-  let m;
-  while ((m = reCredit.exec(joined)) !== null) {
-    fromExplicit.push(parseInt(m[1], 10));
-  }
-  if (fromExplicit.length > 0) {
-    return Math.max(...fromExplicit);
-  }
-
-  const reBeli = /\b(?:beli|top\s*up|topup|isi|tambah|order|mau)\s+(?:\w+\s*){0,4}(\d{1,6})\b/gi;
-  while ((m = reBeli.exec(joined)) !== null) {
-    fromExplicit.push(parseInt(m[1], 10));
-  }
-  if (fromExplicit.length > 0) {
-    return Math.max(...fromExplicit);
-  }
-
-  const last = (lines[lines.length - 1] ?? "").trim();
-  const solo = last.match(/^\s*(\d{1,6})\s*$/);
-  if (solo) {
-    const n = parseInt(solo[1], 10);
-    if (n >= minCredits && n <= 50000) return n;
-  }
-
-  const nums = [...joined.matchAll(/\b(\d{2,6})\b/g)].map((x) => parseInt(x[1], 10));
-  const plausible = nums.filter((n) => n >= minCredits && n <= 50000);
-  if (plausible.length === 1) return plausible[0];
-
-  return null;
-}
-
 function orderIdNow() {
   return `ORDER-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 }
 
 /**
- * Buat transaksi Snap Midtrans; mengembalikan { orderId, redirect_url, token }.
+ * Buat transaksi Snap Midtrans; mengembalikan { orderId, redirect_url, token, grossAmount }.
+ * Panggil dari API/backend Anda setelah validasi jumlah credit user.
  */
 export async function createSnapCreditPurchase({
   secretArn,
@@ -114,4 +76,73 @@ export async function createSnapCreditPurchase({
     redirect_url: redirectUrl,
     token: res?.token,
   };
+}
+
+/**
+ * Baris ORDER yang diharapkan notifikasi Midtrans (status PAID / recovery).
+ * Panggil setelah `createSnapCreditPurchase` dengan orderId & grossAmount yang sama.
+ *
+ * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} ddb
+ * @param {string} tableBilling
+ * @param {{
+ *   senderId: string,
+ *   orderId: string,
+ *   credits: number,
+ *   grossAmount: number,
+ *   provider?: string | null,
+ *   chatId?: string | null,
+ * }} p
+ */
+export async function putPendingCreditOrder(ddb, tableBilling, p) {
+  const now = Date.now();
+  await ddb.send(
+    new PutCommand({
+      TableName: tableBilling,
+      Item: {
+        PK: billingUserPk(p.senderId),
+        SK: `ORDER#${p.orderId}`,
+        userId: String(p.senderId),
+        orderId: p.orderId,
+        credits: p.credits,
+        grossAmount: p.grossAmount,
+        unitPriceIdr: CREDIT_UNIT_PRICE_IDR,
+        provider: p.provider ?? null,
+        chatId: p.chatId != null ? String(p.chatId) : null,
+        createdAt: now,
+        status: "PENDING_SNAP",
+        entityType: "ORDER",
+      },
+    }),
+  );
+}
+
+/**
+ * Snap + persist ORDER (satu alur untuk API Anda).
+ */
+export async function createSnapWithPendingOrder(ddb, tableBilling, opts) {
+  const {
+    secretArn,
+    userId,
+    credits,
+    provider,
+    chatId,
+    unitPriceIdr,
+    isProduction,
+  } = opts;
+  const snap = await createSnapCreditPurchase({
+    secretArn,
+    userId: String(userId),
+    credits,
+    unitPriceIdr,
+    isProduction,
+  });
+  await putPendingCreditOrder(ddb, tableBilling, {
+    senderId: String(userId),
+    orderId: snap.orderId,
+    credits,
+    grossAmount: snap.grossAmount,
+    provider: provider ?? null,
+    chatId: chatId ?? null,
+  });
+  return snap;
 }
